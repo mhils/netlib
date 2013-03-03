@@ -164,7 +164,7 @@ class CertStore:
         """
         if not self.check_domain(commonname):
             return None
-        certpath = os.path.join(self.certdir, commonname + ".pem")
+        certpath = os.path.join(self.certdir, commonname + ".pem").replace("*","")
         if os.path.exists(certpath):
             return certpath
         elif cacert:
