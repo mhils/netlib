@@ -139,7 +139,7 @@ class Reader(_FileLike):
                 raise NetLibTimeout
             except socket.error:
                 raise NetLibDisconnect
-            except SSL.SysCallError, v:
+            except SSL.SysCallError:
                 raise NetLibDisconnect
             self.first_byte_timestamp = self.first_byte_timestamp or time.time()
             if not data:
@@ -179,17 +179,17 @@ class TCPClient:
         self.cert = None
         self.ssl_established = False
 
-    def convert_to_ssl(self, clientcert=None, sni=None, method=TLSv1_METHOD, options=None):
+    def convert_to_ssl(self, cert=None, sni=None, method=TLSv1_METHOD, options=None):
         """
-            clientcert: Path to a file containing both client cert and private key.
+            cert: Path to a file containing both client cert and private key.
         """
         context = SSL.Context(method)
         if options is not None:
             context.set_options(options)
-        if clientcert:
+        if cert:
             try:
-                context.use_privatekey_file(clientcert)
-                context.use_certificate_file(clientcert)
+                context.use_privatekey_file(cert)
+                context.use_certificate_file(cert)
             except SSL.Error, v:
                 raise NetLibError("SSL client certificate error: %s"%str(v))
         self.connection = SSL.Connection(context, self.connection)
@@ -254,15 +254,27 @@ class BaseHandler:
         self.ssl_established = False
         self.clientcert = None
 
-    def convert_to_ssl(self, cert, key, method=SSLv23_METHOD, options=None):
+    def convert_to_ssl(self, cert, key, method=SSLv23_METHOD, options=None, handle_sni=None):
         """
             method: One of SSLv2_METHOD, SSLv3_METHOD, SSLv23_METHOD, or TLSv1_METHOD
+            handle_sni: SNI handler, should take a connection object. Server
+            name can be retrieved like this:
+
+                            connection.get_servername()
+
+                        And you can specify the connection keys as follows:
+
+                            new_context = Context(TLSv1_METHOD)
+                            new_context.use_privatekey(key)
+                            new_context.use_certificate(cert)
+                            connection.set_context(new_context)
         """
         ctx = SSL.Context(method)
         if not options is None:
             ctx.set_options(options)
-        # SNI callback happens during do_handshake()
-        ctx.set_tlsext_servername_callback(self.handle_sni)
+        if handle_sni:
+            # SNI callback happens during do_handshake()
+            ctx.set_tlsext_servername_callback(handle_sni)
         ctx.use_privatekey_file(key)
         ctx.use_certificate_file(cert)
         def ver(*args):
@@ -286,26 +298,9 @@ class BaseHandler:
             self.close()
             self.wfile.close()
             self.rfile.close()
-        except socket.error:
+        except (socket.error, NetLibDisconnect):
             # Remote has disconnected
             pass
-
-    def handle_sni(self, connection):
-        """
-            Called if the client has given a server name indication.
-
-            Server name can be retrieved like this:
-
-                connection.get_servername()
-
-            And you can specify the connection keys as follows:
-
-                new_context = Context(TLSv1_METHOD)
-                new_context.use_privatekey(key)
-                new_context.use_certificate(cert)
-                connection.set_context(new_context)
-        """
-        pass
 
     def handle(self): # pragma: no cover
         raise NotImplementedError
@@ -322,7 +317,7 @@ class BaseHandler:
                 self.connection.shutdown()
             else:
                 self.connection.shutdown(socket.SHUT_RDWR)
-        except (socket.error, SSL.Error), v:
+        except (socket.error, SSL.Error):
             # Socket probably already closed
             pass
         self.connection.close()

@@ -1,5 +1,5 @@
-import string, urlparse
-import odict
+import string, urlparse, binascii
+import odict, utils
 
 class HttpError(Exception):
     def __init__(self, code, msg):
@@ -9,11 +9,38 @@ class HttpError(Exception):
         return "HttpError(%s, %s)"%(self.code, self.msg)
 
 
+class HttpErrorConnClosed(HttpError): pass
+
+
+def _is_valid_port(port):
+    if not 0 <= port <= 65535:
+        return False
+    return True
+
+
+def _is_valid_host(host):
+    try:
+        host.decode("idna")
+    except ValueError:
+        return False
+    if "\0" in host:
+        return None
+    return True
+
+
 def parse_url(url):
     """
         Returns a (scheme, host, port, path) tuple, or None on error.
+
+        Checks that:
+            port is an integer 0-65535
+            host is a valid IDNA-encoded hostname with no null-bytes
+            path is valid ASCII
     """
-    scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
+    try:
+        scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
+    except ValueError:
+        return None
     if not scheme:
         return None
     if ':' in netloc:
@@ -31,6 +58,12 @@ def parse_url(url):
     path = urlparse.urlunparse(('', '', path, params, query, fragment))
     if not path.startswith("/"):
         path = "/" + path
+    if not _is_valid_host(host):
+        return None
+    if not utils.isascii(path):
+        return None
+    if not _is_valid_port(port):
+        return None
     return scheme, host, port, path
 
 
@@ -73,7 +106,7 @@ def read_chunked(code, fp, limit):
     while 1:
         line = fp.readline(128)
         if line == "":
-            raise HttpError(code, "Connection closed prematurely")
+            raise HttpErrorConnClosed(code, "Connection closed prematurely")
         if line != '\r\n' and line != '\n':
             try:
                 length = int(line, 16)
@@ -95,7 +128,7 @@ def read_chunked(code, fp, limit):
     while 1:
         line = fp.readline()
         if line == "":
-            raise HttpError(code, "Connection closed prematurely")
+            raise HttpErrorConnClosed(code, "Connection closed prematurely")
         if line == '\r\n' or line == '\n':
             break
     return content
@@ -166,6 +199,26 @@ def parse_http_protocol(s):
     return major, minor
 
 
+def parse_http_basic_auth(s):
+    words = s.split()
+    if len(words) != 2:
+        return None
+    scheme = words[0]
+    try:
+        user = binascii.a2b_base64(words[1])
+    except binascii.Error:
+        return None
+    parts = user.split(':')
+    if len(parts) != 2:
+        return None
+    return scheme, parts[0], parts[1]
+
+
+def assemble_http_basic_auth(scheme, username, password):
+    v = binascii.b2a_base64(username + ":" + password)
+    return scheme + " " + v
+
+
 def parse_init(line):
     try:
         method, url, protocol = string.split(line)
@@ -193,6 +246,10 @@ def parse_init_connect(line):
         port = int(port)
     except ValueError:
         return None
+    if not _is_valid_port(port):
+        return None
+    if not _is_valid_host(host):
+        return None
     return host, port, httpversion
 
 
@@ -217,7 +274,8 @@ def parse_init_http(line):
     if not v:
         return None
     method, url, httpversion = v
-
+    if not utils.isascii(url):
+        return None
     if not (url.startswith("/") or url == "*"):
         return None
     return method, url, httpversion
@@ -271,6 +329,20 @@ def read_http_body_response(rfile, headers, limit):
     return read_http_body(500, rfile, headers, all, limit)
 
 
+def parse_response_line(line):
+    parts = line.strip().split(" ", 2)
+    if len(parts) == 2: # handle missing message gracefully
+        parts.append("")
+    if len(parts) != 3:
+        return None
+    proto, code, msg = parts
+    try:
+        code = int(code)
+    except ValueError:
+        return None
+    return (proto, code, msg)
+
+
 def read_response(rfile, method, body_size_limit):
     """
         Return an (httpversion, code, msg, headers, content) tuple.
@@ -279,20 +351,14 @@ def read_response(rfile, method, body_size_limit):
     if line == "\r\n" or line == "\n": # Possible leftover from previous message
         line = rfile.readline()
     if not line:
-        raise HttpError(502, "Blank server response.")
-    parts = line.strip().split(" ", 2)
-    if len(parts) == 2: # handle missing message gracefully
-        parts.append("")
-    if not len(parts) == 3:
+        raise HttpErrorConnClosed(502, "Server disconnect.")
+    parts = parse_response_line(line)
+    if not parts:
         raise HttpError(502, "Invalid server response: %s"%repr(line))
     proto, code, msg = parts
     httpversion = parse_http_protocol(proto)
     if httpversion is None:
         raise HttpError(502, "Invalid HTTP version in line: %s"%repr(proto))
-    try:
-        code = int(code)
-    except ValueError:
-        raise HttpError(502, "Invalid server response: %s"%repr(line))
     headers = read_headers(rfile)
     if headers is None:
         raise HttpError(502, "Invalid headers.")

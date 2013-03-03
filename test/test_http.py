@@ -1,6 +1,7 @@
-import cStringIO, textwrap
+import cStringIO, textwrap, binascii
 from netlib import http, odict
 import tutils
+
 
 def test_httperror():
     e = http.HttpError(404, "Not found")
@@ -135,6 +136,8 @@ def test_parse_http_protocol():
 
 def test_parse_init_connect():
     assert http.parse_init_connect("CONNECT host.com:443 HTTP/1.0")
+    assert not http.parse_init_connect("CONNECT \0host.com:443 HTTP/1.0")
+    assert not http.parse_init_connect("CONNECT host.com:444444 HTTP/1.0")
     assert not http.parse_init_connect("bogus")
     assert not http.parse_init_connect("GET host.com:443 HTTP/1.0")
     assert not http.parse_init_connect("CONNECT host.com443 HTTP/1.0")
@@ -163,11 +166,10 @@ def test_parse_init_http():
     assert m == "GET"
     assert u == "/test"
     assert httpversion == (1, 1)
-
     assert not http.parse_init_http("invalid")
     assert not http.parse_init_http("GET invalid HTTP/1.1")
     assert not http.parse_init_http("GET /test foo/1.1")
-
+    assert not http.parse_init_http("GET /test\xc0 HTTP/1.1")
 
 class TestReadHeaders:
     def _read(self, data, verbatim=False):
@@ -222,7 +224,7 @@ def test_read_response():
         r = cStringIO.StringIO(data)
         return  http.read_response(r, method, limit)
 
-    tutils.raises("blank server response", tst, "", "GET", None)
+    tutils.raises("server disconnect", tst, "", "GET", None)
     tutils.raises("invalid server response", tst, "foo", "GET", None)
     data = """
         HTTP/1.1 200 OK
@@ -290,4 +292,23 @@ def test_parse_url():
 
     assert not http.parse_url("https://foo:bar")
     assert not http.parse_url("https://foo:")
+
+    # Invalid IDNA
+    assert not http.parse_url("http://\xfafoo")
+    # Invalid PATH
+    assert not http.parse_url("http:/\xc6/localhost:56121")
+    # Null byte in host
+    assert not http.parse_url("http://foo\0")
+    # Port out of range
+    assert not http.parse_url("http://foo:999999")
+    # Invalid IPv6 URL - see http://www.ietf.org/rfc/rfc2732.txt
+    assert not http.parse_url('http://lo[calhost')
+
+def test_parse_http_basic_auth():
+    vals = ("basic", "foo", "bar")
+    assert http.parse_http_basic_auth(http.assemble_http_basic_auth(*vals)) == vals
+    assert not http.parse_http_basic_auth("")
+    assert not http.parse_http_basic_auth("foo bar")
+    v = "basic " + binascii.b2a_base64("foo")
+    assert not http.parse_http_basic_auth(v)
 
